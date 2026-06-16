@@ -1,0 +1,8 @@
+pandas
+google-cloud-bigquery
+minio
+pyarrow
+requests
+fastapi
+uvicorn[standard]
+python-dotenv
