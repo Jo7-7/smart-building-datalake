@@ -1,0 +1,7 @@
+.env
+credentials/
+.venv/
+__pycache__/
+*.pyc
+minio-data/
+.dist/
