@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Any
 
 import os
 
@@ -16,12 +16,20 @@ from minio.error import S3Error
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "smart-building-datalake")
 BQ_STAGING_DATASET = os.getenv("BQ_STAGING_DATASET", "staging")
 BQ_STAGING_TABLE = os.getenv("BQ_STAGING_TABLE", "stg_sensor_timeseries")
+BQ_CURATED_DATASET = os.getenv("BQ_CURATED_DATASET", "curated")
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
 MINIO_RAW_BUCKET = os.getenv("MINIO_RAW_BUCKET", "raw")
+
+# Tables Curated autorisées, pour éviter toute injection via le paramètre `table`.
+CURATED_TABLES = {
+    "cur_energy_by_device",
+    "cur_environment_by_room",
+    "cur_daily_summary",
+}
 
 app = FastAPI(
     title="Smart Building Data Lake API",
@@ -70,6 +78,27 @@ class StagingRow(BaseModel):
 
 class StagingPage(BaseModel):
     rows: List[StagingRow]
+    page: int
+    page_size: int
+    total_rows: int
+
+
+class RawObject(BaseModel):
+    object_name: str
+    size_bytes: int
+    last_modified: Optional[datetime]
+
+
+class RawPage(BaseModel):
+    objects: List[RawObject]
+    page: int
+    page_size: int
+    total_objects: int
+
+
+class CuratedPage(BaseModel):
+    table: str
+    rows: List[dict]
     page: int
     page_size: int
     total_rows: int
@@ -143,6 +172,62 @@ def stats():
         raw_objects_count=raw_objects_count,
         staging_rows_count=int(result["total_rows"]),
         metric_families=result["metric_families"] or [],
+    )
+
+
+@app.get("/raw", response_model=RawPage, tags=["raw"])
+def get_raw(
+    prefix: Optional[str] = Query(
+        default=None,
+        description="Filtre par préfixe d'objet, ex. 'source_dataset/' ou 'source_api/'.",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=1000),
+):
+    """
+    Liste les objets de la zone Raw (bucket MinIO) avec pagination et filtre par préfixe.
+
+    On expose l'inventaire des objets (nom, taille, date) plutôt que leur contenu
+    binaire, ce qui correspond au rôle d'exploration attendu pour cet endpoint.
+    """
+    minio_client = get_minio_client()
+
+    if not minio_client.bucket_exists(MINIO_RAW_BUCKET):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Bucket Raw '{MINIO_RAW_BUCKET}' introuvable. Lancez l'ingestion d'abord.",
+        )
+
+    # On matérialise la liste pour pouvoir compter et paginer côté API.
+    try:
+        all_objects = list(
+            minio_client.list_objects(
+                bucket_name=MINIO_RAW_BUCKET,
+                prefix=prefix or None,
+                recursive=True,
+            )
+        )
+    except S3Error as e:
+        raise HTTPException(status_code=502, detail=f"Erreur MinIO : {e}")
+
+    total_objects = len(all_objects)
+    offset = (page - 1) * page_size
+    window = all_objects[offset: offset + page_size]
+
+    objects = [
+        RawObject(
+            object_name=obj.object_name,
+            size_bytes=obj.size or 0,
+            last_modified=obj.last_modified,
+        )
+        for obj in window
+    ]
+
+    return RawPage(
+        objects=objects,
+        page=page,
+        page_size=page_size,
+        total_objects=total_objects,
     )
 
 
@@ -240,6 +325,82 @@ def get_staging(
         )
 
     return StagingPage(
+        rows=rows,
+        page=page,
+        page_size=page_size,
+        total_rows=total_rows,
+    )
+
+
+@app.get("/curated", response_model=CuratedPage, tags=["curated"])
+def get_curated(
+    table: str = Query(
+        default="cur_energy_by_device",
+        description="Table Curated à lire : cur_energy_by_device, cur_environment_by_room ou cur_daily_summary.",
+    ),
+    entity: Optional[str] = Query(
+        default=None,
+        description="Filtre sur l'entité (device, room ou entity selon la table).",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=1000),
+):
+    """
+    Retourne des lignes d'une table Curated, avec pagination et filtre optionnel par entité.
+
+    Le paramètre `table` est validé contre une liste blanche pour éviter toute injection,
+    puisqu'un nom de table ne peut pas être passé en paramètre lié dans BigQuery.
+    """
+    if table not in CURATED_TABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Table Curated inconnue : {table}. Valeurs possibles : {sorted(CURATED_TABLES)}.",
+        )
+
+    client = get_bq_client()
+    table_id = f"{GCP_PROJECT_ID}.{BQ_CURATED_DATASET}.{table}"
+
+    # La colonne d'entité dépend de la table ciblée.
+    entity_column = {
+        "cur_energy_by_device": "device",
+        "cur_environment_by_room": "room",
+        "cur_daily_summary": "entity",
+    }[table]
+
+    where_sql = ""
+    params = []
+    if entity:
+        where_sql = f"WHERE {entity_column} = @entity"
+        params.append(bigquery.ScalarQueryParameter("entity", "STRING", entity))
+
+    # Total rows pour la pagination
+    count_sql = f"SELECT COUNT(*) AS total_rows FROM `{table_id}` {where_sql}"
+    count_cfg = bigquery.QueryJobConfig(query_parameters=params)
+    count_result = list(client.query(count_sql, job_config=count_cfg))
+    total_rows = int(count_result[0]["total_rows"]) if count_result else 0
+
+    if total_rows == 0:
+        return CuratedPage(table=table, rows=[], page=page, page_size=page_size, total_rows=0)
+
+    offset = (page - 1) * page_size
+
+    data_sql = f"""
+    SELECT *
+    FROM `{table_id}`
+    {where_sql}
+    LIMIT @limit OFFSET @offset
+    """
+    data_cfg = bigquery.QueryJobConfig(
+        query_parameters=params + [
+            bigquery.ScalarQueryParameter("limit", "INT64", page_size),
+            bigquery.ScalarQueryParameter("offset", "INT64", offset),
+        ]
+    )
+
+    rows = [dict(row.items()) for row in client.query(data_sql, job_config=data_cfg)]
+
+    return CuratedPage(
+        table=table,
         rows=rows,
         page=page,
         page_size=page_size,

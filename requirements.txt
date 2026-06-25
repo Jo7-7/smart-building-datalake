@@ -6,3 +6,5 @@ requests
 fastapi
 uvicorn[standard]
 python-dotenv
+db-dtypes
+scikit-learn

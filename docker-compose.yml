@@ -9,19 +9,36 @@ services:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     volumes:
-      - minio_data:/data
+      - ./minio-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
 
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ACCESS_KEY} $${MINIO_SECRET_KEY}; do
+        echo 'En attente de MinIO...'; sleep 2;
+      done;
+      mc mb --ignore-existing local/raw;
+      echo 'Bucket raw pret';
+      "
+
   pipeline:
     build: .
     container_name: pipeline
     env_file: .env
     depends_on:
-      - minio
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ./credentials:/app/credentials:ro
       - ./data:/app/data:ro
@@ -34,12 +51,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      minio:
-        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
       - ./credentials:/app/credentials:ro
       - ./data:/app/data:ro
-
-
-volumes:
-  minio_data:
