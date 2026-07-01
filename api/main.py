@@ -29,8 +29,8 @@ CURATED_TABLES = {
     "cur_energy_by_device",
     "cur_environment_by_room",
     "cur_daily_summary",
+    "cur_anomaly_scores",
 }
-
 app = FastAPI(
     title="Smart Building Data Lake API",
     description="API Gateway pour les couches Raw / Staging / Curated du data lake Smart Building.",
@@ -365,6 +365,7 @@ def get_curated(
         "cur_energy_by_device": "device",
         "cur_environment_by_room": "room",
         "cur_daily_summary": "entity",
+        "cur_anomaly_scores": "device",
     }[table]
 
     where_sql = ""

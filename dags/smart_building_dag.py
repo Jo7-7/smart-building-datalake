@@ -1,14 +1,17 @@
 """
 DAG Airflow d'orchestration du data lake Smart Building.
 
-Le DAG enchaine les etapes du pipeline medaillon Raw -> Staging -> Curated en
-appelant les scripts deja valides du projet, executes dans le conteneur
-`pipeline` via `docker compose run`. Airflow orchestre, l'image pipeline execute.
+Trois DAG cohabitent, refletant la separation entre preparation de la donnee,
+scheduling de la source temps reel, et entrainement du modele ML :
 
-Deux logiques de planification cohabitent :
-  - le pipeline complet (fichier + API) peut etre declenche manuellement ;
-  - l'ingestion de l'API qualite d'air est planifiee a intervalle regulier,
-    conformement a l'attendu du sujet sur le scheduling.
+  - smart_building_full_pipeline (manuel) : ingestion des deux sources,
+    transformations Raw -> Staging -> Curated, puis APPLICATION du modele
+    d'anomalies (inference legere avec les modeles deja entraines).
+  - smart_building_api_scheduled (@hourly) : re-ingestion planifiee de la
+    qualite d'air Open-Meteo, dates calculees dynamiquement.
+  - smart_building_train_models (@weekly) : ENTRAINEMENT des Isolation Forest.
+    Separe du pipeline de donnees car l'entrainement est couteux et ne doit se
+    faire que periodiquement, alors que l'inference tourne a chaque pipeline.
 
 Pattern repris du TP4 : extract >> transform >> load, avec dependances explicites.
 """
@@ -45,12 +48,13 @@ RUN = (
     "pipeline"
 )
 
-# ───────────────── DAG 1 : pipeline complet (manuel) ─────────────────
+
+# DAG 1 : pipeline complet de donnees + inference (manuel)
 
 with DAG(
     dag_id="smart_building_full_pipeline",
     default_args=default_args,
-    description="Pipeline complet Raw -> Staging -> Curated (fichier + API).",
+    description="Pipeline complet Raw -> Staging -> Curated + scoring anomalies.",
     start_date=datetime(2024, 1, 1),
     schedule_interval=None,  # declenchement manuel
     catchup=False,
@@ -106,14 +110,26 @@ with DAG(
         ),
     )
 
+    # Inference seule : applique les modeles deja entraines (pas d'entrainement ici).
+    apply_anomaly_models = BashOperator(
+        task_id="apply_anomaly_models",
+        bash_command=(
+            f"{RUN} ml/apply_models.py "
+            f"--dataset-curated curated --features-table cur_energy_by_device "
+            f"--scores-table cur_anomaly_scores --gcp-project-id {GCP_PROJECT} "
+            f"--bucket raw --model-prefix models {MINIO_ARGS} "
+            f"--write-mode WRITE_TRUNCATE"
+        ),
+    )
+
     # Dependances : les deux sources alimentent Raw, puis Staging dans le bon
-    # ordre (truncate fichier avant append API), puis Curated.
+    # ordre (truncate fichier avant append API), puis Curated, puis scoring.
     ingest_dataset >> raw_to_staging
     ingest_api >> api_to_staging
-    raw_to_staging >> api_to_staging >> staging_to_curated
+    raw_to_staging >> api_to_staging >> staging_to_curated >> apply_anomaly_models
 
 
-# ───────────────── DAG 2 : ingestion API planifiee ─────────────────
+# DAG 2 : ingestion API planifiee (@hourly)
 
 with DAG(
     dag_id="smart_building_api_scheduled",
@@ -147,3 +163,26 @@ with DAG(
     )
 
     ingest_api_recent >> api_recent_to_staging
+
+
+# DAG 3 : entrainement des modeles (@weekly, cadence lente)
+
+with DAG(
+    dag_id="smart_building_train_models",
+    default_args=default_args,
+    description="Entrainement periodique des Isolation Forest par appareil.",
+    start_date=datetime(2024, 1, 1),
+    schedule_interval="@weekly",  # entrainement rare, decouple du pipeline de donnees
+    catchup=False,
+    tags=["smart-building", "ml", "training"],
+) as train_dag:
+
+    train_anomaly_models = BashOperator(
+        task_id="train_anomaly_models",
+        bash_command=(
+            f"{RUN} ml/train_isolation_forest.py "
+            f"--dataset-curated curated --table cur_energy_by_device "
+            f"--gcp-project-id {GCP_PROJECT} "
+            f"--bucket raw --model-prefix models --contamination 0.02 {MINIO_ARGS}"
+        ),
+    )
